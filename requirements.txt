@@ -1,0 +1,6 @@
+# Intraday fade screener — Python 3.10+
+requests>=2.32.0
+pandas>=2.0.0
+python-dotenv>=1.0.0
+pyotp>=2.9.0
+yfinance>=0.2.40   # market cap (Dhan exposes no fundamentals)
