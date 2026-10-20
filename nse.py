@@ -55,12 +55,49 @@ def _download(d: date) -> Path | None:
 
 
 def load_bhavcopy(d: date) -> dict[str, dict] | None:
-    """Return {symbol: {prev_close, open, high, low, close}} for EQ series, or None."""
+    """Return {symbol: {prev_close, open, high, low, close}} for EQ series.
+
+    Raises ValueError for weekends, future dates, and past weekdays with no
+    bhavcopy of their own (NSE holidays): the NSE archive serves the most
+    recently published file for any missing date, so a cached/downloaded
+    file whose internal DATE1 does not match `d` is refused and deleted.
+    Returns None only when `d` is today and today's file is not published
+    yet (the archive then serves an older file).
+    """
+    if d.weekday() >= 5:
+        raise ValueError(
+            f"{d:%Y-%m-%d} is a {d.strftime('%A')} — the NSE does not trade "
+            "or publish bhavcopy on weekends. Use a weekday."
+        )
+    if d > date.today():
+        raise ValueError(f"{d:%Y-%m-%d} is in the future — no bhavcopy exists yet.")
     path = _download(d)
     if not path:
-        return None
+        if d == date.today():
+            return None  # today's file not published yet
+        raise ValueError(
+            f"No bhavcopy available for {d:%Y-%m-%d} (past weekday — NSE "
+            "holiday, or the download failed)."
+        )
     df = pd.read_csv(path, skipinitialspace=True)
     df.columns = [c.strip() for c in df.columns]
+    if "DATE1" in df.columns and not df.empty:
+        try:
+            file_date = pd.to_datetime(str(df["DATE1"].iloc[0]).strip(),
+                                       format="%d-%b-%Y").date()
+        except ValueError:
+            file_date = None
+        if file_date is not None and file_date != d:
+            path.unlink(missing_ok=True)
+            if d == date.today():
+                return None  # archive served an older file: not published yet
+            raise ValueError(
+                f"No bhavcopy for {d:%Y-%m-%d} — the NSE archive served "
+                f"{file_date:%Y-%m-%d}'s file (likely an NSE holiday)."
+            )
+    elif "DATE1" not in df.columns:
+        log.warning("bhavcopy %s has no DATE1 column — cannot verify its date",
+                    path.name)
     df = df[df["SERIES"].astype(str).str.strip() == "EQ"]
     out: dict[str, dict] = {}
     for r in df.itertuples(index=False):
@@ -85,11 +122,49 @@ def prev_close_map(d: date, lookback: int = 7) -> tuple[date, dict[str, float]]:
     """
     probe = d - timedelta(days=1)
     for _ in range(lookback):
-        data = load_bhavcopy(probe)
-        if data:
-            return probe, {s: v["close"] for s, v in data.items()}
+        if probe.weekday() < 5:
+            try:
+                data = load_bhavcopy(probe)
+            except ValueError:
+                data = None  # NSE holiday or unavailable — keep walking back
+            if data:
+                return probe, {s: v["close"] for s, v in data.items()}
         probe -= timedelta(days=1)
     raise RuntimeError(
         f"No NSE bhavcopy found within {lookback} days before {d} — "
         "cannot establish previous-close baseline."
     )
+
+
+def is_trading_day(d: date) -> bool:
+    """True if a completed NSE session exists for `d` (published bhavcopy).
+
+    Today returns False until its bhavcopy is published, so a live session
+    in progress does not count as a completed trading day.
+    """
+    if d.weekday() >= 5:
+        return False
+    try:
+        return bool(load_bhavcopy(d))
+    except ValueError:
+        return False
+
+
+def last_trading_day(d: date, lookback: int = 10) -> date:
+    """Most recent completed NSE trading day on or before `d`."""
+    probe = d
+    for _ in range(lookback):
+        if is_trading_day(probe):
+            return probe
+        probe -= timedelta(days=1)
+    raise RuntimeError(f"No NSE trading day within {lookback} days up to {d}")
+
+
+def next_trading_day(d: date, lookback: int = 10) -> date:
+    """First completed NSE trading day on or after `d`."""
+    probe = d
+    for _ in range(lookback):
+        if is_trading_day(probe):
+            return probe
+        probe += timedelta(days=1)
+    raise RuntimeError(f"No NSE trading day within {lookback} days after {d}")

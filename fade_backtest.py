@@ -84,15 +84,24 @@ def _yf_download(tickers: list[str], **kw) -> pd.DataFrame:
 
 def download_daily(symbols: list[str], start: date, end: date,
                    refresh: bool) -> dict[str, pd.DataFrame]:
-    """Daily OHLC per symbol (for prev-close + cheap spike pre-filter)."""
+    """Daily OHLC per symbol (for prev-close + cheap spike pre-filter).
+
+    A cache covering only a minority of the requested symbols is a cached
+    failure (rate-limited run): it is ignored and re-downloaded, and a
+    minority-coverage result is never written back.
+    """
     if DAILY_PKL.exists() and not refresh:
-        return pickle.loads(DAILY_PKL.read_bytes())
+        cached = pickle.loads(DAILY_PKL.read_bytes())
+        if len(cached) * 2 >= len(symbols):
+            return cached
+        log.warning("daily cache covers only %d of %d symbols — re-downloading",
+                    len(cached), len(symbols))
 
     out: dict[str, pd.DataFrame] = {}
     tickers = [s + ".NS" for s in symbols]
     for i in range(0, len(tickers), 200):
         chunk = tickers[i:i + 200]
-        log.info("daily %d-%d / %d", i, i + len(chunk), len(tickers))
+        log.debug("daily %d-%d / %d", i, i + len(chunk), len(tickers))
         df = _yf_download(chunk, start=start, end=end, interval="1d")
         for t in chunk:
             sym = t[:-3]
@@ -103,21 +112,32 @@ def download_daily(symbols: list[str], start: date, end: date,
                     out[sym] = sub[["Open", "High", "Low", "Close"]]
             except Exception:  # noqa: BLE001
                 pass
-    DAILY_PKL.write_bytes(pickle.dumps(out))
+    if out and len(out) * 2 >= len(symbols):
+        DAILY_PKL.write_bytes(pickle.dumps(out))
+    else:
+        log.warning("daily data for only %d of %d symbols — not cached",
+                    len(out), len(symbols))
     return out
 
 
 def download_5m(symbols: list[str], start: date, end: date,
                 refresh: bool) -> dict[str, pd.DataFrame]:
-    """5-min OHLC per symbol, cached one pickle per ticker (resumable)."""
+    """5-min OHLC per symbol, cached one pickle per ticker (resumable).
+
+    Empty results (rate-limited or rejected downloads) are never cached,
+    and empty pickles from older failed runs are re-downloaded.
+    """
     out: dict[str, pd.DataFrame] = {}
     todo: list[str] = []
     for s in symbols:
         f = CACHE_5M / f"{s}.pkl"
         if f.exists() and not refresh:
             try:
-                out[s] = pickle.loads(f.read_bytes())
-                continue
+                cached = pickle.loads(f.read_bytes())
+                if not cached.empty:
+                    out[s] = cached
+                    continue
+                # empty pickle = cached failure — re-download it
             except Exception:  # noqa: BLE001
                 pass
         todo.append(s)
@@ -125,7 +145,7 @@ def download_5m(symbols: list[str], start: date, end: date,
     tickers = [s + ".NS" for s in todo]
     for i in range(0, len(tickers), 60):
         chunk = tickers[i:i + 60]
-        log.info("5m %d-%d / %d (have %d cached)", i, i + len(chunk),
+        log.debug("5m %d-%d / %d (have %d cached)", i, i + len(chunk),
                  len(tickers), len(out))
         df = _yf_download(chunk, start=start, end=end, interval="5m")
         for t in chunk:
@@ -139,7 +159,7 @@ def download_5m(symbols: list[str], start: date, end: date,
                 sub = sub.copy()
                 sub.index = sub.index.tz_convert("Asia/Kolkata")
                 sub = sub[["Open", "High", "Low", "Close"]]
-            (CACHE_5M / f"{sym}.pkl").write_bytes(pickle.dumps(sub))
+                (CACHE_5M / f"{sym}.pkl").write_bytes(pickle.dumps(sub))
             out[sym] = sub
         _time.sleep(1)
     return out
@@ -235,6 +255,9 @@ def scan_and_trade(sym: str, df5: pd.DataFrame, daily: pd.DataFrame,
 # --------------------------------------------------------------------------- #
 def market_caps(symbols: list[str], refresh: bool) -> dict[str, float]:
     cache = json.loads(MCAP_JSON.read_text()) if MCAP_JSON.exists() and not refresh else {}
+    # Drop previously cached failures and never write new ones — a
+    # rate-limited lookup must not stick as None forever.
+    cache = {s: v for s, v in cache.items() if v is not None}
     for s in symbols:
         if s in cache:
             continue
@@ -244,7 +267,8 @@ def market_caps(symbols: list[str], refresh: bool) -> dict[str, float]:
             cap = info.get("marketCap")
         except Exception:  # noqa: BLE001
             cap = None
-        cache[s] = (cap / 1e7) if cap else None  # INR -> crore
+        if cap:
+            cache[s] = cap / 1e7  # INR -> crore
     MCAP_JSON.write_text(json.dumps(cache))
     return cache
 
@@ -263,8 +287,10 @@ def summarize(trades: list[dict], label: str) -> None:
         v = [t[H] for t in trades if t.get(H) is not None]
         if not v:
             continue
-        print(f"  {H:>8} {sum(v)/len(v):>+7.2f} {st.median(v):>+8.2f} "
-              f"{sum(1 for x in v if x > 0)/len(v)*100:>5.0f}")
+        line = f"  {H:>8} {sum(v)/len(v):>+7.2f} {st.median(v):>+8.2f}"
+        if H not in ("MFE", "MAE"):  # win % is meaningless for excursion rows
+            line += f" {sum(1 for x in v if x > 0)/len(v)*100:>5.0f}"
+        print(line)
 
 
 def main() -> None:
@@ -276,9 +302,15 @@ def main() -> None:
     p.add_argument("--mcap-min", type=float, default=500.0)
     p.add_argument("--limit", type=int, default=0, help="cap universe (debug)")
     p.add_argument("--refresh", action="store_true")
+    p.add_argument("--verbose", action="store_true",
+                   help="show chunk-by-chunk download progress (debug level)")
     args = p.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
+    # Default: one short line per stage (INFO). --verbose adds the
+    # chunk-by-chunk download progress (DEBUG). Third-party loggers stay at
+    # WARNING so yfinance debug noise stays hidden either way.
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(message)s",
                         datefmt="%H:%M:%S")
+    logging.getLogger("fade_bt").setLevel(logging.DEBUG if args.verbose else logging.INFO)
 
     end = date.today() + timedelta(days=1)
     start = date.today() - timedelta(days=args.days)

@@ -9,13 +9,30 @@ trade_ai/.env is reused so we don't duplicate secrets.
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 ROOT = Path(__file__).resolve().parent
 _LOCAL_ENV = ROOT / ".env"
 _TRADE_AI_ENV = ROOT.parent / "trade_ai" / ".env"
 ENV_PATH = _TRADE_AI_ENV if not _LOCAL_ENV.exists() and _TRADE_AI_ENV.exists() else _LOCAL_ENV
-load_dotenv(ENV_PATH, override=True)
+
+
+def _apply_env_values(values: dict[str, str | None]) -> None:
+    """Apply env-file values to the environment.
+
+    Non-blank values override the environment (a saved Dhan token must beat
+    a stale exported one). A blank value never clobbers an exported
+    variable: .env.example ships blank lines such as DEEPSEEK_API_KEY=, and
+    a plain override would replace an exported key with an empty string.
+    """
+    for key, val in values.items():
+        if val:
+            os.environ[key] = val
+        elif key not in os.environ:
+            os.environ[key] = ""
+
+
+_apply_env_values(dotenv_values(ENV_PATH))
 
 CLIENT_ID: str = os.getenv("DHAN_CLIENT_ID", "")
 ACCESS_TOKEN: str = os.getenv("DHAN_ACCESS_TOKEN", "")

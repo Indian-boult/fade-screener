@@ -62,20 +62,25 @@ def _fetch_one(symbol: str) -> float | None:
 
 
 def get_market_caps(symbols: list[str]) -> dict[str, float | None]:
-    """Return {symbol: market_cap_in_crore_or_None}, using/refreshing cache."""
+    """Return {symbol: market_cap_in_crore_or_None}, using/refreshing cache.
+
+    Failed lookups are never cached — a rate-limited fetch must not stick
+    as None for MCAP_CACHE_DAYS.
+    """
     cache = _load_cache()
     result: dict[str, float | None] = {}
     fetched = 0
     for sym in symbols:
         entry = cache.get(sym)
-        if entry and _is_fresh(entry):
+        if entry and entry.get("mcap_cr") is not None and _is_fresh(entry):
             result[sym] = entry["mcap_cr"]
             continue
         mcap = _fetch_one(sym)
-        cache[sym] = {"mcap_cr": mcap, "asof": datetime.now(timezone.utc).isoformat()}
+        if mcap is not None:
+            cache[sym] = {"mcap_cr": mcap, "asof": datetime.now(timezone.utc).isoformat()}
         result[sym] = mcap
         fetched += 1
     if fetched:
         _save_cache(cache)
-        log.info("Fetched market cap for %d symbol(s) via yfinance", fetched)
+        log.debug("Fetched market cap for %d symbol(s) via yfinance", fetched)
     return result
